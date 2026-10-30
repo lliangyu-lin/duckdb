@@ -459,6 +459,41 @@ static ColumnMapResult MapColumnMap(ClientContext &context, const MultiFileColum
 	return result;
 }
 
+//! One field of a struct in the file, preferring a fixed-width field, then any other primitive field. Reading it
+//! shows which rows have a NULL struct.
+static bool GetPresenceIndex(const MultiFileColumnDefinition &local_column, ColumnIndex &result) {
+	auto &children = local_column.children;
+	for (idx_t i = 0; i < children.size(); i++) {
+		auto &type = children[i].type;
+		if (!type.IsNested() && type.id() != LogicalTypeId::SQLNULL && TypeIsConstantSize(type.InternalType())) {
+			result = ColumnIndex(i);
+			return true;
+		}
+	}
+	for (idx_t i = 0; i < children.size(); i++) {
+		if (!children[i].type.IsNested() && children[i].type.id() != LogicalTypeId::SQLNULL) {
+			result = ColumnIndex(i);
+			return true;
+		}
+	}
+	for (idx_t i = 0; i < children.size(); i++) {
+		ColumnIndex child_index;
+		if (children[i].type.id() == LogicalTypeId::STRUCT && GetPresenceIndex(children[i], child_index)) {
+			vector<ColumnIndex> child_indexes;
+			child_indexes.push_back(std::move(child_index));
+			result = ColumnIndex(i, std::move(child_indexes));
+			return true;
+		}
+	}
+	for (idx_t i = 0; i < children.size(); i++) {
+		if (children[i].type.id() != LogicalTypeId::SQLNULL) {
+			result = ColumnIndex(i);
+			return true;
+		}
+	}
+	return false;
+}
+
 static ColumnMapResult MapColumnStruct(ClientContext &context, const MultiFileColumnDefinition &global_column,
                                        const ColumnIndex &global_index, const MultiFileColumnDefinition &local_column,
                                        const MultiFileLocalIndex &local_id, const ColumnMapper &mapper,
@@ -553,8 +588,17 @@ static ColumnMapResult MapColumnStruct(ClientContext &context, const MultiFileCo
 	ColumnMapResult result;
 	result.local_column = local_column;
 
-	if (!column_mapping.empty()) {
+	if (child_indexes.empty()) {
+		// none of the selected fields is in the file - read one field that is, instead of the whole struct
+		ColumnIndex presence_index;
+		if (GetPresenceIndex(local_column, presence_index)) {
+			child_indexes.push_back(std::move(presence_index));
+		}
+	}
+
+	if (!column_mapping.empty() || !is_root) {
 		// we have column mappings at this level - construct the struct
+		// a nested struct is mapped even without any, so that its defaults only apply where it is not NULL
 		result.column_map = Value::STRUCT(std::move(column_mapping));
 		if (!is_root) {
 			// if this is nested we need to refer to the current column at this level
@@ -671,6 +715,75 @@ static unique_ptr<Expression> ConstructMapExpression(ClientContext &context, Mul
 		children.push_back(std::move(mapping.default_value));
 	}
 	return BindBuiltinScalarFunction(context, RemapStructFun::Name, std::move(children));
+}
+
+static unique_ptr<Expression> CreateStructExtractExpression(unique_ptr<Expression> source_expr,
+                                                            const LogicalType &source_type, idx_t child_idx) {
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(std::move(source_expr));
+	arguments.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(static_cast<int64_t>(child_idx + 1))));
+
+	BoundScalarFunction bound_func(GetExtractAtFunction());
+	bound_func.SetReturnType(StructType::GetChildType(source_type, child_idx));
+
+	return make_uniq<BoundFunctionExpression>(std::move(bound_func), std::move(arguments),
+	                                          StructExtractAtFun::GetBindData(child_idx));
+}
+
+//! Whether a pushed-down extract reaches a field that is missing from the file, below a struct that is in the file,
+//! and that has a non-NULL default. Pushed down, the default would be returned even where that struct is NULL.
+static bool ExtractsMissingDefault(ClientContext &context, const MultiFileColumnDefinition &column,
+                                   const MultiFileColumnDefinition &local_column, const ColumnIndex &index,
+                                   const ColumnMapper &mapper) {
+	if (!index.IsPushdownExtract() || column.type.id() != LogicalTypeId::STRUCT ||
+	    local_column.type.id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	auto &child_index = index.GetChildIndexes()[0];
+	if (!child_index.HasPrimaryIndex() || child_index.GetPrimaryIndex() >= column.children.size()) {
+		// without children the column is mapped as a whole
+		return false;
+	}
+	auto &child = column.children[child_index.GetPrimaryIndex()];
+	auto nested_mapper = mapper.Create(local_column.children);
+	auto local_child = nested_mapper->Find(child);
+	if (local_child.IsValid()) {
+		return ExtractsMissingDefault(context, child, local_column.children[local_child.GetIndex()], child_index,
+		                              *nested_mapper);
+	}
+	if (!child.default_expression) {
+		return false;
+	}
+	auto default_value = nested_mapper->GetDefaultExpression(context, child, false);
+	return !(default_value->GetExpressionType() == ExpressionType::VALUE_CONSTANT &&
+	         default_value->Cast<BoundConstantExpression>().GetValue().IsNull());
+}
+
+//! The path of a pushed-down extract, as a projection of the fields along it
+static ColumnIndex GetProjectionIndex(const ColumnIndex &index) {
+	vector<ColumnIndex> child_indexes;
+	for (auto &child : index.GetChildIndexes()) {
+		if (!child.HasPrimaryIndex()) {
+			return ColumnIndex(index.GetPrimaryIndex());
+		}
+		child_indexes.push_back(GetProjectionIndex(child));
+	}
+	return ColumnIndex(index.GetPrimaryIndex(), std::move(child_indexes));
+}
+
+//! Extracts the field a pushed-down extract selects from the value of the whole column
+static unique_ptr<Expression> CreatePathExtractExpression(unique_ptr<Expression> expr, const LogicalType &type,
+                                                          const ColumnIndex &index) {
+	reference<const LogicalType> current_type = type;
+	reference<const ColumnIndex> current = index;
+	while (current.get().IsPushdownExtract()) {
+		auto &child = current.get().GetChildIndexes()[0];
+		auto child_idx = child.GetPrimaryIndex();
+		expr = CreateStructExtractExpression(std::move(expr), current_type.get(), child_idx);
+		current_type = StructType::GetChildType(current_type.get(), child_idx);
+		current = child;
+	}
+	return expr;
 }
 
 ResultColumnMapping MultiFileColumnMapper::CreateColumnMappingByMapper(const ColumnMapper &mapper) {
@@ -807,7 +920,17 @@ ResultColumnMapping MultiFileColumnMapper::CreateColumnMappingByMapper(const Col
 			continue;
 		}
 
-		auto column_map = MapColumn(context, global_column, global_id, local_columns, mapper, local_idx);
+		// A file that lacks the field a pushed-down extract selects reads the path as a projection instead, so that
+		// remap_struct applies the field's default only where its parent struct is not NULL. Files that have the
+		// field keep the pushdown.
+		auto root_entry = global_id.IsPushdownExtract() ? mapper.Find(global_column) : MultiFileLocalIndex();
+		bool extract_after_read =
+		    root_entry.IsValid() &&
+		    ExtractsMissingDefault(context, global_column, local_columns[root_entry.GetIndex()], global_id, mapper);
+		auto projection_id = extract_after_read ? GetProjectionIndex(global_id) : ColumnIndex();
+		const ColumnIndex &read_id = extract_after_read ? projection_id : global_id;
+
+		auto column_map = MapColumn(context, global_column, read_id, local_columns, mapper, local_idx);
 		if (!column_map.column_index) {
 			// no columns were emitted
 			reader_data.expressions.push_back(std::move(column_map.default_value));
@@ -819,10 +942,19 @@ ResultColumnMapping MultiFileColumnMapper::CreateColumnMappingByMapper(const Col
 		auto &local_type = local_columns[local_id].type;
 		auto global_column_type = global_id.HasType() ? global_id.GetScanType() : global_column.type;
 		auto local_column_type = local_index->HasType() ? local_index->GetScanType() : local_type;
-		auto expr =
-		    ConstructMapExpression(context, local_idx, column_map, global_column_type, local_column_type, trivial_map);
-		reader_data.expressions.push_back(std::move(expr));
 		auto filter_conversion = trivial_map ? FilterConversionType::COPY_DIRECTLY : FilterConversionType::CAST_FILTER;
+		unique_ptr<Expression> expr;
+		if (extract_after_read) {
+			expr = ConstructMapExpression(context, local_idx, column_map, global_column.type, local_column_type, false);
+			expr = CreatePathExtractExpression(std::move(expr), global_column.type, global_id);
+			expr = BoundCastExpression::AddCastToType(context, std::move(expr), global_column_type);
+			// the reader reads the struct, so filters on the field are evaluated on this expression
+			filter_conversion = FilterConversionType::CANNOT_CONVERT;
+		} else {
+			expr = ConstructMapExpression(context, local_idx, column_map, global_column_type, local_column_type,
+			                              trivial_map);
+		}
+		reader_data.expressions.push_back(std::move(expr));
 
 		MultiFileColumnMap index_mapping(std::move(*column_map.mapping), local_column_type, global_column_type,
 		                                 filter_conversion);
@@ -924,19 +1056,6 @@ static unique_ptr<Expression> CreateReferenceExpression(const LogicalType &type)
 static unique_ptr<Expression> GetFilterExpression(const TableFilter &filter) {
 	auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "GetFilterExpression");
 	return expr_filter.expr->Copy();
-}
-
-static unique_ptr<Expression> CreateStructExtractExpression(unique_ptr<Expression> source_expr,
-                                                            const LogicalType &source_type, idx_t child_idx) {
-	vector<unique_ptr<Expression>> arguments;
-	arguments.push_back(std::move(source_expr));
-	arguments.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(static_cast<int64_t>(child_idx + 1))));
-
-	BoundScalarFunction bound_func(GetExtractAtFunction());
-	bound_func.SetReturnType(StructType::GetChildType(source_type, child_idx));
-
-	return make_uniq<BoundFunctionExpression>(std::move(bound_func), std::move(arguments),
-	                                          StructExtractAtFun::GetBindData(child_idx));
 }
 
 //! A cast matches STRUCT fields by name, so nested fields need the same names and positions and invertible casts

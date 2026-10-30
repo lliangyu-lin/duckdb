@@ -251,3 +251,12 @@ FROM (SELECT remap_struct(
 ) AS mapped);
 ----
 true	{'renamed': NULL}
+
+# A NULL default for an unmapped nested struct, when the source struct has NULL rows
+query II
+SELECT id, remap_struct(s, NULL::STRUCT(a VARCHAR, n STRUCT(b INT)), {'a': 'a'}, {'n': NULL::STRUCT(b INT)})
+FROM (VALUES (1, {'a': 'one', 'n': {'b': 1}}), (2, NULL::STRUCT(a VARCHAR, n STRUCT(b INT)))) t(id, s)
+ORDER BY id;
+----
+1	{'a': one, 'n': NULL}
+2	NULL

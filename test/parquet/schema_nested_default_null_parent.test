@@ -1,0 +1,327 @@
+# name: test/parquet/schema_nested_default_null_parent.test
+# description: A field missing from the file reads its default only where its parent struct is not NULL
+# group: [parquet]
+
+require parquet
+
+statement ok
+CREATE TABLE original (
+	id INTEGER,
+	s STRUCT(a VARCHAR, n STRUCT(b INTEGER)),
+	t STRUCT(n STRUCT(b INTEGER)),
+	u STRUCT(l INTEGER[]),
+	l STRUCT(a INTEGER)[]
+);
+
+# Row 2 has a NULL nested struct, row 3 has NULL top-level structs, and row 4 has structs whose fields are NULL.
+# The list l holds NULL elements in rows 1 and 2.
+statement ok
+INSERT INTO original VALUES
+	(1, {'a': 'one', 'n': {'b': 1}}, {'n': {'b': 1}}, {'l': [1]}, [{'a': 1}, NULL]),
+	(2, {'a': 'two', 'n': NULL}, {'n': NULL}, {'l': NULL}, [NULL]),
+	(3, NULL, NULL, NULL, NULL),
+	(4, {'a': NULL, 'n': {'b': NULL}}, {'n': {'b': NULL}}, {'l': []}, []);
+
+statement ok
+COPY original TO '{TEST_DIR}/nested_default_null_parent.parquet' (FIELD_IDS {
+	id: 0,
+	s: {__duckdb_field_id: 1, a: 2, n: {__duckdb_field_id: 3, b: 4}},
+	t: {__duckdb_field_id: 5, n: {__duckdb_field_id: 6, b: 7}},
+	u: {__duckdb_field_id: 8, l: {__duckdb_field_id: 9, element: 10}},
+	l: {__duckdb_field_id: 11, element: {__duckdb_field_id: 12, a: 13}}
+});
+
+# Add s.x, s.n.y, t.x and u.x with non-NULL defaults. The file has none of them.
+statement ok
+CREATE VIEW mapped AS SELECT * FROM read_parquet('{TEST_DIR}/nested_default_null_parent.parquet', schema = map {
+	0: {name: 'id', type: 'INTEGER', default_value: NULL},
+	1: {
+		name: 's', type: 'STRUCT(a VARCHAR, n STRUCT(b INTEGER, y INTEGER), x INTEGER)', default_value: NULL,
+		children: map {
+			2: {name: 'a', type: 'VARCHAR', default_value: NULL},
+			3: {
+				name: 'n', type: 'STRUCT(b INTEGER, y INTEGER)', default_value: NULL,
+				children: map {
+					4: {name: 'b', type: 'INTEGER', default_value: NULL},
+					21: {name: 'y', type: 'INTEGER', default_value: 5}
+				}
+			},
+			20: {name: 'x', type: 'INTEGER', default_value: 7}
+		}
+	},
+	5: {
+		name: 't', type: 'STRUCT(n STRUCT(b INTEGER), x INTEGER)', default_value: NULL,
+		children: map {
+			6: {
+				name: 'n', type: 'STRUCT(b INTEGER)', default_value: NULL,
+				children: map {7: {name: 'b', type: 'INTEGER', default_value: NULL}}
+			},
+			22: {name: 'x', type: 'INTEGER', default_value: 7}
+		}
+	},
+	8: {
+		name: 'u', type: 'STRUCT(l INTEGER[], x INTEGER)', default_value: NULL,
+		children: map {
+			9: {
+				name: 'l', type: 'INTEGER[]', default_value: NULL,
+				children: map {10: {name: 'element', type: 'INTEGER', default_value: NULL}}
+			},
+			23: {name: 'x', type: 'INTEGER', default_value: 7}
+		}
+	}
+});
+
+# Reading the whole struct keeps its NULLs.
+query II
+SELECT id, s FROM mapped ORDER BY id;
+----
+1	{'a': one, 'n': {'b': 1, 'y': 5}, 'x': 7}
+2	{'a': two, 'n': NULL, 'x': 7}
+3	NULL
+4	{'a': NULL, 'n': {'b': NULL, 'y': 5}, 'x': 7}
+
+# Reading only the missing field must give NULL where the struct is NULL, matching the reads above.
+query II
+SELECT id, s.x FROM mapped ORDER BY id;
+----
+1	7
+2	7
+3	NULL
+4	7
+
+query III
+SELECT id, s.a, s.x FROM mapped ORDER BY id;
+----
+1	one	7
+2	two	7
+3	NULL	NULL
+4	NULL	7
+
+query II
+SELECT id, s.x::VARCHAR FROM mapped ORDER BY id;
+----
+1	7
+2	7
+3	NULL
+4	7
+
+query II
+SELECT id, s.n.y FROM mapped ORDER BY id;
+----
+1	5
+2	NULL
+3	NULL
+4	5
+
+# The struct's other fields are a struct or a list.
+query III
+SELECT id, t.x, u.x FROM mapped ORDER BY id;
+----
+1	7	7
+2	7	7
+3	NULL	NULL
+4	7	7
+
+# Filters on the missing field must match the values above.
+query I
+SELECT id FROM mapped WHERE s.x = 7 ORDER BY id;
+----
+1
+2
+4
+
+query I
+SELECT id FROM mapped WHERE s.x IS NULL ORDER BY id;
+----
+3
+
+query I
+SELECT id FROM mapped WHERE s.x = 8 ORDER BY id;
+----
+
+query I
+SELECT id FROM mapped WHERE s.n.y = 5 ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id FROM mapped WHERE s.n.y IS NULL ORDER BY id;
+----
+2
+3
+
+query I
+SELECT count(*) FROM mapped WHERE s.x = 7 AND s.n.y IS NULL;
+----
+1
+
+query I
+SELECT id FROM mapped WHERE s.x IN (7, 8) ORDER BY id;
+----
+1
+2
+4
+
+# Top-N pushes a dynamic filter into the scan.
+query II
+SELECT id, s.x FROM mapped ORDER BY s.x NULLS FIRST, id LIMIT 2;
+----
+3	NULL
+1	7
+
+# Reading the whole value and reading the fields must agree.
+statement ok
+CREATE TABLE full_values AS SELECT * FROM mapped;
+
+query IIII
+SELECT bool_and(m.s.x IS NOT DISTINCT FROM f.s.x),
+       bool_and(m.s.n.y IS NOT DISTINCT FROM f.s.n.y),
+       bool_and(m.t.x IS NOT DISTINCT FROM f.t.x),
+       bool_and(m.u.x IS NOT DISTINCT FROM f.u.x)
+FROM mapped m JOIN full_values f USING (id);
+----
+true	true	true	true
+
+# The struct's fields in the file were all dropped from the schema, so only fields the schema no longer has show
+# where the struct is NULL.
+statement ok
+CREATE VIEW dropped AS SELECT * FROM read_parquet('{TEST_DIR}/nested_default_null_parent.parquet', schema = map {
+	0: {name: 'id', type: 'INTEGER', default_value: NULL},
+	1: {
+		name: 's', type: 'STRUCT(n STRUCT(y INTEGER), x INTEGER)', default_value: NULL,
+		children: map {
+			3: {
+				name: 'n', type: 'STRUCT(y INTEGER)', default_value: NULL,
+				children: map {21: {name: 'y', type: 'INTEGER', default_value: 5}}
+			},
+			20: {name: 'x', type: 'INTEGER', default_value: 7}
+		}
+	}
+});
+
+query II
+SELECT id, s FROM dropped ORDER BY id;
+----
+1	{'n': {'y': 5}, 'x': 7}
+2	{'n': NULL, 'x': 7}
+3	NULL
+4	{'n': {'y': 5}, 'x': 7}
+
+query III
+SELECT id, s.x, s.n.y FROM dropped ORDER BY id;
+----
+1	7	5
+2	7	NULL
+3	NULL	NULL
+4	7	5
+
+query I
+SELECT id FROM dropped WHERE s.x IS NULL ORDER BY id;
+----
+3
+
+query I
+SELECT id FROM dropped WHERE s.n.y IS NULL ORDER BY id;
+----
+2
+3
+
+# A file written after the fields were added holds them, so it keeps the pushed-down extract. Reading it in the
+# same scan as the old file must not change either file's values.
+statement ok
+CREATE TABLE newer (
+	id INTEGER,
+	s STRUCT(a VARCHAR, n STRUCT(b INTEGER, y INTEGER), x INTEGER)
+);
+
+statement ok
+INSERT INTO newer VALUES
+	(5, {'a': 'five', 'n': {'b': 5, 'y': 40}, 'x': 44}),
+	(6, NULL);
+
+statement ok
+COPY newer TO '{TEST_DIR}/nested_default_null_parent_new.parquet' (FIELD_IDS {
+	id: 0,
+	s: {__duckdb_field_id: 1, a: 2, n: {__duckdb_field_id: 3, b: 4, y: 21}, x: 20}
+});
+
+statement ok
+CREATE VIEW mixed AS SELECT * FROM read_parquet([
+	'{TEST_DIR}/nested_default_null_parent.parquet',
+	'{TEST_DIR}/nested_default_null_parent_new.parquet'
+], schema = map {
+	0: {name: 'id', type: 'INTEGER', default_value: NULL},
+	1: {
+		name: 's', type: 'STRUCT(a VARCHAR, n STRUCT(b INTEGER, y INTEGER), x INTEGER)', default_value: NULL,
+		children: map {
+			2: {name: 'a', type: 'VARCHAR', default_value: NULL},
+			3: {
+				name: 'n', type: 'STRUCT(b INTEGER, y INTEGER)', default_value: NULL,
+				children: map {
+					4: {name: 'b', type: 'INTEGER', default_value: NULL},
+					21: {name: 'y', type: 'INTEGER', default_value: 5}
+				}
+			},
+			20: {name: 'x', type: 'INTEGER', default_value: 7}
+		}
+	}
+});
+
+query III
+SELECT id, s.x, s.n.y FROM mixed ORDER BY id;
+----
+1	7	5
+2	7	NULL
+3	NULL	NULL
+4	7	5
+5	44	40
+6	NULL	NULL
+
+query I
+SELECT id FROM mixed WHERE s.x IS NULL ORDER BY id;
+----
+3
+6
+
+query I
+SELECT id FROM mixed WHERE s.x = 44 ORDER BY id;
+----
+5
+
+# The plan keeps the pushed-down extract; only a file without the field reads the struct instead.
+query II
+EXPLAIN SELECT s.x FROM mixed;
+----
+physical_plan	<REGEX>:.*Projections: s\.x.*
+
+# A field added to the struct inside a list reads NULL for NULL elements, instead of the default.
+statement ok
+CREATE VIEW listed AS SELECT * FROM read_parquet('{TEST_DIR}/nested_default_null_parent.parquet', schema = map {
+	0: {name: 'id', type: 'INTEGER', default_value: NULL},
+	11: {
+		name: 'l', type: 'STRUCT(x INTEGER)[]', default_value: NULL,
+		children: map {
+			12: {
+				name: 'element', type: 'STRUCT(x INTEGER)', default_value: NULL,
+				children: map {24: {name: 'x', type: 'INTEGER', default_value: 7}}
+			}
+		}
+	}
+});
+
+query II
+SELECT id, l FROM listed ORDER BY id;
+----
+1	[{'x': 7}, NULL]
+2	[NULL]
+3	NULL
+4	[]
+
+query II
+SELECT id, [e.x FOR e IN l] FROM listed ORDER BY id;
+----
+1	[7, NULL]
+2	[NULL]
+3	NULL
+4	[]
